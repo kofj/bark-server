@@ -7,6 +7,7 @@ vars:
     sh: date "+%F %T"
   COMMIT_ID:
     sh: git rev-parse HEAD
+  DOCKER_SOCK: /var/run/docker.sock
 
 tasks:
   clean:
@@ -20,7 +21,7 @@ tasks:
     label: build-{{.TASK}}
     cmds:
       - |
-        GOOS={{.GOOS}} GOARCH={{.GOARCH}} GOARM={{.GOARM}} GOMIPS={{.GOMIPS}} \
+        GOOS={{.GOOS}} GOARCH={{.GOARCH}} GOARM={{.GOARM}} GOMIPS={{.GOMIPS}} GOAMD64={{.GOAMD64}} \
         go build -trimpath -o dist/bark-server_{{.TASK}} -ldflags \
         "-w -s -X 'main.version={{.BUILD_VERSION}}' -X 'main.buildDate={{.BUILD_DATE}}' -X 'main.commitID={{.COMMIT_ID}}'"
   linux_386:
@@ -39,6 +40,15 @@ tasks:
           GOOS: linux,
           GOARCH: amd64
         }
+  linux_amd64_v2:
+    cmds:
+      - task: build-tpl
+        vars: {
+          TASK: "{{.TASK}}",
+          GOOS: linux,
+          GOARCH: amd64,
+          GOAMD64: v2
+        }
   linux_amd64_v3:
     cmds:
       - task: build-tpl
@@ -47,6 +57,15 @@ tasks:
           GOOS: linux,
           GOARCH: amd64,
           GOAMD64: v3
+        }
+  linux_amd64_v4:
+    cmds:
+      - task: build-tpl
+        vars: {
+          TASK: "{{.TASK}}",
+          GOOS: linux,
+          GOARCH: amd64,
+          GOAMD64: v4
         }
   linux_armv5:
     cmds:
@@ -142,6 +161,15 @@ tasks:
           GOOS: windows,
           GOARCH: amd64
         }
+  windows_amd64_v2.exe:
+    cmds:
+      - task: build-tpl
+        vars: {
+          TASK: "{{.TASK}}",
+          GOOS: windows,
+          GOARCH: amd64,
+          GOAMD64: v2
+        }
   windows_amd64_v3.exe:
     cmds:
       - task: build-tpl
@@ -151,6 +179,47 @@ tasks:
           GOARCH: amd64,
           GOAMD64: v3
         }
+  windows_amd64_v4.exe:
+    cmds:
+      - task: build-tpl
+        vars: {
+          TASK: "{{.TASK}}",
+          GOOS: windows,
+          GOARCH: amd64,
+          GOAMD64: v4
+        }
+  darwin_amd64:
+    cmds:
+      - task: build-tpl
+        vars: {
+          TASK: "{{.TASK}}",
+          GOOS: darwin,
+          GOARCH: amd64,
+        }
+  darwin_arm64:
+    cmds:
+      - task: build-tpl
+        vars: {
+          TASK: "{{.TASK}}",
+          GOOS: darwin,
+          GOARCH: arm64,
+        }        
+  freebsd_amd64:
+    cmds:
+      - task: build-tpl
+        vars: {
+          TASK: "{{.TASK}}",
+          GOOS: freebsd,
+          GOARCH: amd64,
+        }        
+  freebsd_arm64:
+    cmds:
+      - task: build-tpl
+        vars: {
+          TASK: "{{.TASK}}",
+          GOOS: freebsd,
+          GOARCH: arm64,
+        }        
   docker:
     cmds:
       - docker build -t finab/bark-server:{{.BUILD_VERSION}} -f deploy/Dockerfile .
@@ -159,9 +228,9 @@ tasks:
     vars:
       PLATFORM: linux/amd64,linux/arm/v7,linux/arm64
     cmds:
-      - docker run -dt --name dind -v {{.DOCKER_SOCK}}:/var/run/docker.sock -v $(pwd):/bark-server docker
+      - docker run -dt --name dind -v {{.DOCKER_SOCK}}:/var/run/docker.sock -v $(pwd):/bark-server docker tail -f /dev/null
       - defer: docker rm -f dind
-      #- docker exec -w /bark-server -it dind docker run --privileged --rm tonistiigi/binfmt --install all
+      - docker exec -w /bark-server -it dind docker login
       - docker exec -w /bark-server -it dind docker buildx create --name builder --driver docker-container --bootstrap --use
       - docker exec -w /bark-server -it dind docker buildx build --platform {{.PLATFORM}} -t finab/bark-server:{{.BUILD_VERSION}} -f deploy/Dockerfile --push .
   default:
@@ -170,7 +239,9 @@ tasks:
       - task: copy-resource
       - task: linux_386
       - task: linux_amd64
+      - task: linux_amd64_v2
       - task: linux_amd64_v3
+      - task: linux_amd64_v4
       - task: linux_armv5
       - task: linux_armv6
       - task: linux_armv7
@@ -182,4 +253,14 @@ tasks:
       - task: linux_mips64le
       - task: windows_386.exe
       - task: windows_amd64.exe
+      - task: windows_amd64_v2.exe
       - task: windows_amd64_v3.exe
+      - task: windows_amd64_v4.exe
+      - task: darwin_amd64
+      - task: darwin_arm64
+      - task: freebsd_amd64
+      - task: freebsd_arm64
+  release:
+    cmds:
+      - task: default
+      - ghr -u finb -t $GITHUB_TOKEN -replace -recreate -name "Bump {{.BUILD_VERSION}}" --debug {{.BUILD_VERSION}} dist

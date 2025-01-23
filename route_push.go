@@ -1,14 +1,20 @@
 package main
 
 import (
-	"github.com/gofiber/fiber/v2/utils"
+	"fmt"
 	"net/url"
 	"strings"
+	"sync"
+
+	"github.com/gofiber/fiber/v2/utils"
 
 	"github.com/finb/bark-server/v2/apns"
 
 	"github.com/gofiber/fiber/v2"
 )
+
+// Maximum number of batch pushes allowed, -1 means no limit
+var maxBatchPushCount = -1
 
 func init() {
 	// V2 API
@@ -27,11 +33,15 @@ func init() {
 		router.Get("/:device_key/:title/:body", func(c *fiber.Ctx) error { return routeDoPush(c) })
 		router.Post("/:device_key/:title/:body", func(c *fiber.Ctx) error { return routeDoPush(c) })
 
-		router.Get("/:device_key/:category/:title/:body", func(c *fiber.Ctx) error { return routeDoPush(c) })
-		router.Post("/:device_key/:category/:title/:body", func(c *fiber.Ctx) error { return routeDoPush(c) })
+		router.Get("/:device_key/:title/:subtitle/:body", func(c *fiber.Ctx) error { return routeDoPush(c) })
+		router.Post("/:device_key/:title/:subtitle/:body", func(c *fiber.Ctx) error { return routeDoPush(c) })
 	})
 }
 
+// Set the maximum number of batch pushes allowed
+func SetMaxBatchPushCount(count int) {
+	maxBatchPushCount = count
+}
 func routeDoPush(c *fiber.Ctx) error {
 	// Get content-type
 	contentType := utils.ToLower(utils.UnsafeString(c.Request().Header.ContentType()))
@@ -39,7 +49,12 @@ func routeDoPush(c *fiber.Ctx) error {
 	// Json request uses the API V2
 	if strings.HasPrefix(contentType, "application/json") {
 		return routeDoPushV2(c)
+	} else {
+		return routeDoPushV1(c)
 	}
+}
+
+func routeDoPushV1(c *fiber.Ctx) error {
 
 	params := make(map[string]interface{})
 	visitor := func(key, value []byte) {
@@ -49,7 +64,6 @@ func routeDoPush(c *fiber.Ctx) error {
 	c.Request().URI().QueryArgs().VisitAll(visitor)
 	// parse post args
 	c.Request().PostArgs().VisitAll(visitor)
-
 	// parse multipartForm values
 	form, err := c.Request().MultipartForm()
 	if err == nil {
@@ -59,10 +73,22 @@ func routeDoPush(c *fiber.Ctx) error {
 			}
 		}
 	}
+	// parse url path (highest priority)
+	pathParams, err := extractUrlPathParams(c)
+	if err != nil {
+		return c.Status(500).JSON(failed(400, "url path parse failed: %v", err))
+	}
+	for key, val := range pathParams {
+		params[key] = val
+	}
 
-	return push(c, params)
+	code, err := push(params)
+	if err != nil {
+		return c.Status(code).JSON(failed(code, "%s", err.Error()))
+	} else {
+		return c.JSON(success())
+	}
 }
-
 func routeDoPushV2(c *fiber.Ctx) error {
 	params := make(map[string]interface{})
 	// parse body
@@ -70,17 +96,119 @@ func routeDoPushV2(c *fiber.Ctx) error {
 		return c.Status(400).JSON(failed(400, "request bind failed: %v", err))
 	}
 	// parse query args (medium priority)
-	c.Request().URI().QueryArgs().VisitAll(func(key, value []byte){
+	c.Request().URI().QueryArgs().VisitAll(func(key, value []byte) {
 		params[strings.ToLower(string(key))] = string(value)
 	})
-	return push(c, params)
+	// parse url path (highest priority)
+	pathParams, err := extractUrlPathParams(c)
+	if err != nil {
+		return c.Status(500).JSON(failed(400, "url path parse failed: %v", err))
+	}
+	for key, val := range pathParams {
+		params[key] = val
+	}
+
+	var deviceKeys []string
+	// Get the device_keys array from params
+	if keys, ok := params["device_keys"]; ok {
+		switch keys := keys.(type) {
+		case string:
+			deviceKeys = strings.Split(keys, ",")
+		case []interface{}:
+			for _, key := range keys {
+				deviceKeys = append(deviceKeys, fmt.Sprint(key))
+			}
+		default:
+			return c.Status(400).JSON(failed(400, "invalid type for device_keys"))
+		}
+		delete(params, "device_keys")
+	}
+
+	count := len(deviceKeys)
+
+	if count == 0 {
+		// Single push
+		code, err := push(params)
+		if err != nil {
+			return c.Status(code).JSON(failed(code, "%s", err.Error()))
+		} else {
+			return c.JSON(success())
+		}
+	} else {
+		// Batch push
+		if count > maxBatchPushCount && maxBatchPushCount != -1 {
+			return c.Status(400).JSON(failed(400, "batch push count exceeds the maximum limit: %d", maxBatchPushCount))
+		}
+
+		var wg sync.WaitGroup
+		result := make([]map[string]interface{}, count)
+		var mu sync.Mutex
+
+		for i := 0; i < count; i++ {
+			// Copy params
+			newParams := make(map[string]interface{})
+			for k, v := range params {
+				newParams[k] = v
+			}
+			newParams["device_key"] = deviceKeys[i]
+
+			wg.Add(1)
+			go func(i int, newParams map[string]interface{}) {
+				defer wg.Done()
+
+				// Push
+				code, err := push(newParams)
+
+				// Save result
+				mu.Lock()
+				result[i] = make(map[string]interface{})
+				if err != nil {
+					result[i]["message"] = err.Error()
+				}
+				result[i]["code"] = code
+				result[i]["device_key"] = deviceKeys[i]
+				mu.Unlock()
+			}(i, newParams)
+		}
+		wg.Wait()
+		return c.JSON(data(result))
+	}
 }
 
-func push(c *fiber.Ctx, params map[string]interface{}) error {
+func extractUrlPathParams(c *fiber.Ctx) (map[string]interface{}, error) {
+	// parse url path (highest priority)
+	params := make(map[string]interface{})
+	if pathDeviceKey := c.Params("device_key"); pathDeviceKey != "" {
+		params["device_key"] = pathDeviceKey
+	}
+	if subtitle := c.Params("subtitle"); subtitle != "" {
+		str, err := url.QueryUnescape(subtitle)
+		if err != nil {
+			return nil, err
+		}
+		params["subtitle"] = str
+	}
+	if title := c.Params("title"); title != "" {
+		str, err := url.QueryUnescape(title)
+		if err != nil {
+			return nil, err
+		}
+		params["title"] = str
+	}
+	if body := c.Params("body"); body != "" {
+		str, err := url.QueryUnescape(body)
+		if err != nil {
+			return nil, err
+		}
+		params["body"] = str
+	}
+	return params, nil
+}
+
+func push(params map[string]interface{}) (int, error) {
 	// default value
 	msg := apns.PushMessage{
-		Category:  "myNotificationCategory",
-		Body:      "NoContent",
+		Body:      "",
 		Sound:     "1107",
 		ExtParams: make(map[string]interface{}),
 	}
@@ -91,8 +219,8 @@ func push(c *fiber.Ctx, params map[string]interface{}) error {
 			switch strings.ToLower(string(key)) {
 			case "device_key":
 				msg.DeviceKey = val
-			case "category":
-				msg.Category = val
+			case "subtitle":
+				msg.Subtitle = val
 			case "title":
 				msg.Title = val
 			case "body":
@@ -116,45 +244,23 @@ func push(c *fiber.Ctx, params map[string]interface{}) error {
 		}
 	}
 
-	// parse url path (highest priority)
-	if pathDeviceKey := c.Params("device_key"); pathDeviceKey != "" {
-		msg.DeviceKey = pathDeviceKey
-	}
-	if category := c.Params("category"); category != "" {
-		str, err := url.QueryUnescape(category)
-		if err != nil {
-			return err
-		}
-		msg.Category = str
-	}
-	if title := c.Params("title"); title != "" {
-		str, err := url.QueryUnescape(title)
-		if err != nil {
-			return err
-		}
-		msg.Title = str
-	}
-	if body := c.Params("body"); body != "" {
-		str, err := url.QueryUnescape(body)
-		if err != nil {
-			return err
-		}
-		msg.Body = str
+	if msg.DeviceKey == "" {
+		return 400, fmt.Errorf("device key is empty")
 	}
 
-	if msg.DeviceKey == "" {
-		return c.Status(400).JSON(failed(400, "device key is empty"))
+	if msg.Body == "" && msg.Title == "" && msg.Subtitle == "" {
+		msg.Body = "Empty message"
 	}
 
 	deviceToken, err := db.DeviceTokenByKey(msg.DeviceKey)
 	if err != nil {
-		return c.Status(400).JSON(failed(400, "failed to get device token: %v", err))
+		return 400, fmt.Errorf("failed to get device token: %v", err)
 	}
 	msg.DeviceToken = deviceToken
 
 	err = apns.Push(&msg)
 	if err != nil {
-		return c.Status(500).JSON(failed(500, "push failed: %v", err))
+		return 500, fmt.Errorf("push failed: %v", err)
 	}
-	return c.JSON(success())
+	return 200, nil
 }

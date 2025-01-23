@@ -8,6 +8,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/finb/bark-server/v2/apns"
 	"github.com/finb/bark-server/v2/database"
 
 	jsoniter "github.com/json-iterator/go"
@@ -111,6 +112,20 @@ func main() {
 				Value:   "",
 			},
 			&cli.IntFlag{
+				Name:    "max-batch-push-count",
+				Usage:   "Maximum number of batch pushes allowed, -1 means no limit",
+				EnvVars: []string{"BARK_SERVER_MAX_BATCH_PUSH_COUNT"},
+				Value:   -1,
+				Action:  func(ctx *cli.Context, v int) error { SetMaxBatchPushCount(v); return nil },
+			},
+			&cli.IntFlag{
+				Name:    "max-apns-client-count",
+				Usage:   "Maximum number of APNs client connections",
+				EnvVars: []string{"BARK_SERVER_MAX_APNS_CLIENT_COUNT"},
+				Value:   1,
+				Action:  func(ctx *cli.Context, v int) error { return apns.ReCreateAPNS(v) },
+			},
+			&cli.IntFlag{
 				Name:    "concurrency",
 				Usage:   "Maximum number of concurrent connections",
 				EnvVars: []string{"BARK_SERVER_CONCURRENCY"},
@@ -155,7 +170,7 @@ func main() {
 				ProxyHeader:       c.String("proxy-header"),
 				ReduceMemoryUsage: c.Bool("reduce-memory-usage"),
 				JSONEncoder:       jsoniter.Marshal,
-				Network: "tcp",
+				Network:           "tcp",
 				ErrorHandler: func(c *fiber.Ctx, err error) error {
 					code := fiber.StatusInternalServerError
 					if e, ok := err.(*fiber.Error); ok {
@@ -183,7 +198,7 @@ func main() {
 			}
 
 			go func() {
-				sigs := make(chan os.Signal)
+				sigs := make(chan os.Signal, 1)
 				signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 				for range sigs {
 					logger.Warn("Received a termination signal, bark server shutdown...")

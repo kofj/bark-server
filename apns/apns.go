@@ -19,7 +19,7 @@ import (
 type PushMessage struct {
 	DeviceToken string `form:"-" json:"-" xml:"-" query:"-"`
 	DeviceKey   string `form:"device_key,omitempty" json:"device_key,omitempty" xml:"device_key,omitempty" query:"device_key,omitempty"`
-	Category    string `form:"category,omitempty" json:"category,omitempty" xml:"category,omitempty" query:"category,omitempty"`
+	Subtitle    string `form:"subtitle,omitempty" json:"subtitle,omitempty" xml:"subtitle,omitempty" query:"subtitle,omitempty"`
 	Title       string `form:"title,omitempty" json:"title,omitempty" xml:"title,omitempty" query:"title,omitempty"`
 	Body        string `form:"body,omitempty" json:"body,omitempty" xml:"body,omitempty" query:"body,omitempty"`
 	// ios notification sound(system sound please refer to http://iphonedevwiki.net/index.php/AudioServices)
@@ -34,9 +34,18 @@ const (
 	PayloadMaximum = 4096
 )
 
-var cli *apns2.Client
+var clients = make(chan *apns2.Client, 1)
 
+// 初始化 APNS 客户端池
 func init() {
+	ReCreateAPNS(1)
+}
+
+func ReCreateAPNS(maxClientCount int) error {
+	if maxClientCount < 1 {
+		return fmt.Errorf("invalid number of clients")
+	}
+
 	authKey, err := token.AuthKeyFromBytes([]byte(apnsPrivateKey))
 	if err != nil {
 		logger.Fatalf("failed to create APNS auth key: %v", err)
@@ -56,32 +65,41 @@ func init() {
 		rootCAs.AppendCertsFromPEM([]byte(ca))
 	}
 
-	cli = &apns2.Client{
-		Token: &token.Token{
-			AuthKey: authKey,
-			KeyID:   keyID,
-			TeamID:  teamID,
-		},
-		HTTPClient: &http.Client{
-			Transport: &http2.Transport{
-				DialTLS: apns2.DialTLS,
-				TLSClientConfig: &tls.Config{
-					RootCAs: rootCAs,
-				},
+	clients = make(chan *apns2.Client, maxClientCount)
+
+	for i := 0; i < min(runtime.NumCPU(), maxClientCount); i++ {
+		client := &apns2.Client{
+			Token: &token.Token{
+				AuthKey: authKey,
+				KeyID:   keyID,
+				TeamID:  teamID,
 			},
-			Timeout: apns2.HTTPClientTimeout,
-		},
-		Host: apns2.HostProduction,
+			HTTPClient: &http.Client{
+				Transport: &http2.Transport{
+					DialTLS: apns2.DialTLS,
+					TLSClientConfig: &tls.Config{
+						RootCAs: rootCAs,
+					},
+				},
+				Timeout: apns2.HTTPClientTimeout,
+			},
+			Host: apns2.HostProduction,
+		}
+		logger.Infof("create apns client: %d", i)
+		clients <- client
 	}
+
 	logger.Info("init apns client success...")
+	return nil
 }
 
 func Push(msg *PushMessage) error {
 	pl := payload.NewPayload().
 		AlertTitle(msg.Title).
+		AlertSubtitle(msg.Subtitle).
 		AlertBody(msg.Body).
 		Sound(msg.Sound).
-		Category(msg.Category)
+		Category("myNotificationCategory")
 
 	group, exist := msg.ExtParams["group"]
 	if exist {
@@ -93,14 +111,10 @@ func Push(msg *PushMessage) error {
 		pl.Custom(strings.ToLower(k), fmt.Sprintf("%v", v))
 	}
 
-	// JSON payload maximum size of 4 KB (4096 bytes)
-	// https://developer.apple.com/documentation/usernotifications/setting_up_a_remote_notification_server/sending_notification_requests_to_apns#2947607
-	plContentForJson, _ := pl.MarshalJSON()
-	if len(plContentForJson) > PayloadMaximum {
-		return fmt.Errorf("APNS Push Msg Payload too Large %d > 4096 bytes", len(plContentForJson))
-	}
+	client := <-clients // grab a client from the pool
+	clients <- client   // add the client back to the pool
 
-	resp, err := cli.Push(&apns2.Notification{
+	resp, err := client.Push(&apns2.Notification{
 		DeviceToken: msg.DeviceToken,
 		Topic:       topic,
 		Payload:     pl.MutableContent(),
